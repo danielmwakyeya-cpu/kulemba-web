@@ -20,7 +20,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: @@{{ github.token }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/setup-python@v5
         with:
