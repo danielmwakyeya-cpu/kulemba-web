@@ -1,0 +1,364 @@
+# Kulemba, Kuwerengela, Kuonetsa and PDF as installable, offline phone apps.
+# One file: create it at .github/workflows/pages.yml, then run it from the Actions tab.
+name: Build and publish the apps
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: @@{{ github.token }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow (draws the app icons)
+        run: pip install pillow
+
+      - name: Download the latest browser builds
+        run: |
+          mkdir -p dl
+          for repo in wordcraft gridcraft deckcraft pdfcraft; do
+            mkdir -p "dl/$repo"
+            for tag in $(gh release list --repo "storytold/$repo" --limit 5 --json tagName --jq '.[].tagName'); do
+              gh release download "$tag" --repo "storytold/$repo" --pattern '*web*.zip' --dir "dl/$repo" --clobber || true
+              if ls dl/$repo/*.zip >/dev/null 2>&1; then
+                echo "$repo: using release $tag"
+                break
+              fi
+            done
+          done
+          ls -lh dl/*
+
+      - name: Make them installable and offline-capable
+        run: |
+          cat > assemble.py <<'ASSEMBLE_PY_END'
+          #!/usr/bin/env python3
+          """Turn the downloaded ArtCraft browser builds into one installable, offline-capable site.
+
+          usage: assemble.py [DOWNLOAD_DIR] [OUTPUT_DIR]
+
+          DOWNLOAD_DIR holds one folder per app (wordcraft, gridcraft, deckcraft, pdfcraft), each with the
+          release's `*-web-*.zip`. For every app that has a zip this script:
+            - unpacks it to OUTPUT_DIR/<slug>/
+            - adds a web app manifest, icons and a service worker so Android Chrome can install it
+              and run it with no internet
+          and then writes a small landing page at OUTPUT_DIR/index.html.
+          """
+          import hashlib
+          import json
+          import re
+          import shutil
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import quote
+
+          from PIL import Image, ImageDraw, ImageFont
+
+          DL = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dl")
+          OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("site")
+
+          APPS = [
+              dict(repo="wordcraft", slug="kulemba", name="Kulemba", what="Write documents", color="#1f7a3d", glyph="doc"),
+              dict(repo="gridcraft", slug="kuwerengela", name="Kuwerengela", what="Spreadsheets", color="#2b2b2b", glyph="grid"),
+              dict(repo="deckcraft", slug="kuonetsa", name="Kuonetsa", what="Presentations", color="#c8102e", glyph="slide"),
+              dict(repo="pdfcraft", slug="pdf", name="PDF", what="Read and edit PDFs", color="#b86e00", glyph="pdf"),
+          ]
+
+          WHITE = (255, 255, 255, 255)
+
+
+          # ----------------------------------------------------------------------------- icons
+          def draw_icon(glyph: str, color: str) -> Image.Image:
+              """512 px, full-bleed square (so Android can mask it), drawing kept inside the safe zone."""
+              s = 512
+              img = Image.new("RGBA", (s, s), color)
+              d = ImageDraw.Draw(img)
+              bg = color
+              if glyph == "doc":
+                  d.rounded_rectangle((150, 105, 362, 407), radius=22, fill=WHITE)
+                  for y in (180, 230, 280, 330):
+                      d.rounded_rectangle((188, y, 324, y + 14), radius=7, fill=bg)
+              elif glyph == "grid":
+                  d.rounded_rectangle((120, 120, 392, 392), radius=26, fill=WHITE)
+                  for v in (211, 301):
+                      d.rectangle((v, 120, v + 10, 392), fill=bg)
+                      d.rectangle((120, v, 392, v + 10), fill=bg)
+              elif glyph == "slide":
+                  d.rounded_rectangle((100, 130, 412, 330), radius=22, fill=WHITE)
+                  for i, h in enumerate((50, 90, 70)):
+                      x = 168 + i * 66
+                      d.rounded_rectangle((x, 290 - h, x + 40, 290), radius=8, fill=bg)
+                  d.rectangle((250, 330, 262, 378), fill=WHITE)
+                  d.rounded_rectangle((196, 372, 316, 392), radius=10, fill=WHITE)
+              elif glyph == "pdf":
+                  d.rounded_rectangle((150, 105, 362, 407), radius=22, fill=WHITE)
+                  font = ImageFont.load_default(size=96)
+                  d.text((256, 256), "PDF", font=font, fill=bg, anchor="mm")
+              return img
+
+
+          def write_icons(dest: Path, app: dict) -> None:
+              big = draw_icon(app["glyph"], app["color"])
+              big.convert("RGB").save(dest / "icon-512.png", optimize=True)
+              big.resize((192, 192), Image.LANCZOS).convert("RGB").save(dest / "icon-192.png", optimize=True)
+
+
+          # ----------------------------------------------------------------------------- unpack
+          def find_zip(app: dict):
+              folder = DL / app["repo"]
+              zips = sorted(folder.glob("*.zip")) if folder.is_dir() else []
+              return zips[-1] if zips else None
+
+
+          def unpack(zip_path: Path, dest: Path) -> None:
+              """Unpack, flattening a single wrapper folder so index.html sits at dest's top."""
+              with tempfile.TemporaryDirectory() as tmp:
+                  tmp_path = Path(tmp)
+                  with zipfile.ZipFile(zip_path) as z:
+                      for member in z.infolist():
+                          target = (tmp_path / member.filename).resolve()
+                          if tmp_path.resolve() not in target.parents and target != tmp_path.resolve():
+                              raise SystemExit(f"unsafe path in zip: {member.filename}")
+                      z.extractall(tmp_path)
+                  candidates = sorted(tmp_path.rglob("index.html"), key=lambda p: len(p.parts))
+                  if not candidates:
+                      raise SystemExit(f"{zip_path.name}: no index.html inside")
+                  root = candidates[0].parent
+                  if dest.exists():
+                      shutil.rmtree(dest)
+                  shutil.copytree(root, dest)
+
+
+          # ----------------------------------------------------------------------------- PWA files
+          def patch_index(index: Path, app: dict) -> None:
+              html = index.read_text(encoding="utf-8", errors="replace")
+              if "manifest.webmanifest" in html:
+                  return
+              head = (
+                  '<link rel="manifest" href="manifest.webmanifest">\n'
+                  f'<meta name="theme-color" content="{app["color"]}">\n'
+                  '<link rel="apple-touch-icon" href="icon-192.png">\n'
+                  '<meta name="mobile-web-app-capable" content="yes">\n'
+              )
+              reg = (
+                  "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){"
+                  "navigator.serviceWorker.register('sw.js').catch(function(e){console.warn('service worker',e)})})}"
+                  "</script>\n"
+              )
+              html, n = re.subn(r"</head>", lambda m: head + "</head>", html, count=1, flags=re.I)
+              if n == 0:
+                  html = head + html
+              html, n = re.subn(r"</body>", lambda m: reg + "</body>", html, count=1, flags=re.I)
+              if n == 0:
+                  html += reg
+              index.write_text(html, encoding="utf-8")
+
+
+          def write_manifest(dest: Path, app: dict) -> None:
+              manifest = {
+                  "id": "./",
+                  "name": app["name"],
+                  "short_name": app["name"],
+                  "description": app["what"] + ". Works offline.",
+                  "start_url": "./",
+                  "scope": "./",
+                  "display": "standalone",
+                  "orientation": "any",
+                  "background_color": "#e6e6e6",
+                  "theme_color": app["color"],
+                  "icons": [
+                      {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                      {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                      {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+                  ],
+              }
+              (dest / "manifest.webmanifest").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+          SW = r"""'use strict';
+          const SLUG = '__SLUG__';
+          const VERSION = '__VERSION__';
+          const CACHE = SLUG + '-' + VERSION;
+          const FILES = __FILES__;
+
+          self.addEventListener('install', function (event) {
+            event.waitUntil((async function () {
+              const cache = await caches.open(CACHE);
+              await cache.addAll(FILES);
+              await self.skipWaiting();
+            })());
+          });
+
+          self.addEventListener('activate', function (event) {
+            event.waitUntil((async function () {
+              const names = await caches.keys();
+              await Promise.all(names.filter(function (n) {
+                return n.indexOf(SLUG + '-') === 0 && n !== CACHE;
+              }).map(function (n) { return caches.delete(n); }));
+              await self.clients.claim();
+            })());
+          });
+
+          self.addEventListener('fetch', function (event) {
+            const req = event.request;
+            if (req.method !== 'GET') return;
+            const url = new URL(req.url);
+            if (url.origin !== self.location.origin) return;
+            event.respondWith((async function () {
+              const cache = await caches.open(CACHE);
+              let hit = await cache.match(req, { ignoreSearch: true });
+              if (hit) return hit;
+              if (req.mode === 'navigate') {
+                hit = await cache.match('./index.html');
+                if (hit) return hit;
+              }
+              try {
+                return await fetch(req);
+              } catch (e) {
+                return new Response('Offline and not saved yet.', { status: 503, statusText: 'Offline' });
+              }
+            })());
+          });
+          """
+
+
+          def write_sw(dest: Path, app: dict) -> int:
+              entries, digest = [], hashlib.sha1(SW.encode())
+              total = 0
+              for p in sorted(dest.rglob("*")):
+                  if not p.is_file() or p.name == "sw.js":
+                      continue
+                  rel = p.relative_to(dest).as_posix()
+                  size = p.stat().st_size
+                  total += size
+                  digest.update(f"{rel}:{size}".encode())
+                  entries.append("./" + quote(rel))
+              files = ["./"] + entries
+              sw = (
+                  SW.replace("__SLUG__", app["slug"])
+                  .replace("__VERSION__", digest.hexdigest()[:10])
+                  .replace("__FILES__", json.dumps(files, indent=1))
+              )
+              (dest / "sw.js").write_text(sw, encoding="utf-8")
+              return total
+
+
+          # ----------------------------------------------------------------------------- landing page
+          LANDING = """<!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="theme-color" content="#1f7a3d">
+          <title>Rogue Codings Office</title>
+          <style>
+          :root{--bg:#f6f5f1;--card:#fff;--ink:#1d1d1b;--muted:#6b6a64;--line:#e3e1da}
+          @media (prefers-color-scheme:dark){:root{--bg:#171715;--card:#22221f;--ink:#ecebe6;--muted:#a09f98;--line:#34332f}}
+          *{box-sizing:border-box}
+          body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+          main{max-width:560px;margin:0 auto;padding:28px 16px 48px}
+          h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+          .sub{color:var(--muted);margin:0 0 24px}
+          a.card,div.card{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px;margin:12px 0;color:inherit;text-decoration:none}
+          a.card:active{transform:scale(.99)}
+          .card img{width:64px;height:64px;border-radius:14px;flex:none}
+          .card b{display:block;font-size:19px}
+          .card span{color:var(--muted);font-size:14px}
+          .off{opacity:.55}
+          ol{padding-left:20px;color:var(--muted);font-size:14px}
+          footer{margin-top:28px;color:var(--muted);font-size:13px}
+          </style>
+          </head>
+          <body>
+          <main>
+          <h1>Rogue Codings Office</h1>
+          <p class="sub">Write, calculate, present and read PDFs. Install once, then it works offline.</p>
+          __CARDS__
+          <h2 style="font-size:16px;margin:28px 0 4px">Install on Android</h2>
+          <ol>
+          <li>Open an app above in Chrome and let it finish loading (the first load downloads the whole app, so use Wi-Fi).</li>
+          <li>Tap the menu (&#8942;) &rarr; <b>Install app</b> or <b>Add to Home screen</b>.</li>
+          <li>Open it from your home screen. It now runs without internet.</li>
+          </ol>
+          <footer>Built from the open-source ArtCraft apps (WordCraft, GridCraft, DeckCraft, PdfCraft), used under their MIT or Apache-2.0 licences.</footer>
+          </main>
+          </body>
+          </html>
+          """
+
+
+          def write_landing(built: list) -> None:
+              cards = []
+              for app in APPS:
+                  if app["slug"] in built:
+                      cards.append(
+                          f'<a class="card" href="{app["slug"]}/"><img src="{app["slug"]}/icon-192.png" alt="">'
+                          f'<div><b>{app["name"]}</b><span>{app["what"]}</span></div></a>'
+                      )
+                  else:
+                      cards.append(
+                          f'<div class="card off"><div><b>{app["name"]}</b><span>{app["what"]}: not built yet</span></div></div>'
+                      )
+              (OUT / "index.html").write_text(LANDING.replace("__CARDS__", "\n".join(cards)), encoding="utf-8")
+              (OUT / ".nojekyll").write_text("", encoding="utf-8")
+
+
+          # ----------------------------------------------------------------------------- main
+          def main() -> None:
+              OUT.mkdir(parents=True, exist_ok=True)
+              built = []
+              for app in APPS:
+                  z = find_zip(app)
+                  if z is None:
+                      print(f"::warning::no web build found for {app['repo']}; skipping {app['name']}")
+                      continue
+                  dest = OUT / app["slug"]
+                  unpack(z, dest)
+                  write_icons(dest, app)
+                  write_manifest(dest, app)
+                  patch_index(dest / "index.html", app)
+                  total = write_sw(dest, app)
+                  built.append(app["slug"])
+                  print(f"{app['name']}: {z.name} -> {dest} ({total / 1e6:.1f} MB)")
+              if not built:
+                  raise SystemExit("no apps were built; nothing to publish")
+              write_landing(built)
+              print("built:", ", ".join(built))
+
+
+          if __name__ == "__main__":
+              main()
+          ASSEMBLE_PY_END
+          python assemble.py dl site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
